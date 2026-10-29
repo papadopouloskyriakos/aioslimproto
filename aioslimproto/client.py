@@ -21,6 +21,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
+from .clock import JiffiesEpoch
 from .const import (
     FALLBACK_CODECS,
     FALLBACK_MODEL,
@@ -42,8 +43,10 @@ from .models import (
     MediaDetails,
     MediaMetadata,
     PlayerState,
+    PlayPoint,
     Preset,
     RemoteCode,
+    SlimStatus,
     TransitionType,
     VisualisationType,
 )
@@ -51,6 +54,13 @@ from .util import parse_capabilities, parse_headers, parse_status
 from .volume import SlimProtoVolume
 
 # ruff: noqa: ARG002,FBT001,FBT002,RUF006
+
+STAT_STRUCT = "!BBBLLLLHLLLLHLL"
+STAT_STRUCT_SIZE = struct.calcsize(
+    STAT_STRUCT
+)  # 47 bytes, followed by an optional error code
+START_AT_IMMEDIATE_S = 10  # squeezelite starts at once when told to start further ahead
+DEFAULT_PACKET_LATENCY_MS = 2
 
 
 class SlimClient:
@@ -95,6 +105,11 @@ class SlimClient:
         # when _jiffies was reported; kept apart from _last_timestamp, which is
         # also reset when a stream is flushed or started
         self._jiffies_timestamp: float = 0
+        # the player's clock tracked against ours, fed by every status report
+        self._jiffies_epoch = JiffiesEpoch()
+        self._packet_latency_ms: int = DEFAULT_PACKET_LATENCY_MS
+        self._last_status: SlimStatus | None = None
+        self._playpoint: PlayPoint | None = None
         self._last_timestamp: float = 0
         self._elapsed_milliseconds: float = 0
         # set while a new stream is requested but not yet started (STMs); used to
@@ -256,6 +271,45 @@ class SlimClient:
     def jiffies(self) -> int:
         """Return (realtime) epoch timestamp from player."""
         return self._jiffies + int((time.time() - self._jiffies_timestamp) * 1000)
+
+    @property
+    def jiffies_epoch(self) -> float | None:
+        """Return server time (time.time()) at which the player's clock read zero."""
+        return self._jiffies_epoch.epoch
+
+    @property
+    def packet_latency_ms(self) -> int:
+        """Return the assumed delivery time of a status report in milliseconds."""
+        return self._packet_latency_ms
+
+    @packet_latency_ms.setter
+    def packet_latency_ms(self, value: int) -> None:
+        """Set the assumed delivery time of a status report in milliseconds."""
+        self._packet_latency_ms = max(0, int(value))
+
+    @property
+    def last_status(self) -> SlimStatus | None:
+        """Return the status fields of the last STAT received from the player."""
+        return self._last_status
+
+    @property
+    def stream_buffer_fullness(self) -> int:
+        """Return bytes of stream data buffered at the last STAT, 0 before the first."""
+        return self._last_status.stream_buffer_fullness if self._last_status else 0
+
+    @property
+    def output_buffer_fullness(self) -> int:
+        """Return bytes of decoded audio buffered at the last STAT, 0 before any."""
+        return self._last_status.output_buffer_fullness if self._last_status else 0
+
+    @property
+    def playpoint(self) -> PlayPoint | None:
+        """Return the play point of the last STAT, None until one describes the stream.
+
+        Only the reports of the current stream count: a flush clears the play point
+        until the new stream reports its start (STMs).
+        """
+        return self._playpoint
 
     @property
     def current_url(self) -> str | None:
@@ -443,6 +497,8 @@ class SlimClient:
             self._elapsed_milliseconds = 0
             self._last_timestamp = time.time()
             self._awaiting_stream_start = True
+            # the flushed stream's reports no longer describe anything
+            self._playpoint = None
 
         media_details = MediaDetails(
             url=url,
@@ -554,6 +610,35 @@ class SlimClient:
         # https://wiki.slimdevices.com/index.php/SlimProto_TCP_protocol.html#u.2C_p.2C_a_.26_t_commands_and_replay_gain_field
         await self._send_strm(b"u", replay_gain=timestamp)
 
+    def server_time_from_jiffies(self, jiffies: int) -> float:
+        """Return the server time at which the player's clock read jiffies.
+
+        Server time is time.time(). Corrected by packet_latency_ms. Raises
+        PlayerClockUnknown before the first STAT.
+        """
+        return self._jiffies_epoch.server_time(jiffies, self._packet_latency_ms / 1000)
+
+    def jiffies_from_server_time(self, server_time: float) -> int:
+        """Return the player's clock at the given server time, as a u32 for strm.
+
+        Not corrected by packet latency (as Lyrion's startAt). Raises
+        PlayerClockUnknown before the first STAT.
+        """
+        return self._jiffies_epoch.jiffies_at(server_time)
+
+    async def start_at(self, server_time: float) -> None:
+        """Start (unpause) playback at the given server time (time.time()).
+
+        The player confirms with STMr at once and plays silence until then. A time more
+        than 10 seconds ahead, or already passed, makes squeezelite start immediately.
+        """
+        jiffies = self.jiffies_from_server_time(server_time)
+        if server_time - time.time() > START_AT_IMMEDIATE_S:
+            self.logger.debug(
+                "start_at %.3f is too far ahead; player starts now", server_time
+            )
+        await self._send_strm(b"u", replay_gain=jiffies)
+
     def signal_update(self) -> None:
         """Signal a player updated event to listeners."""
         self.callback(self, EventType.PLAYER_UPDATED)
@@ -637,6 +722,8 @@ class SlimClient:
                     data = await self._reader.read(64)
             except (TimeoutError, ConnectionResetError):
                 break
+            # taken once per read: every packet in it arrived together
+            received_at = time.time()
             # handle incoming data from socket
             buffer = buffer + data
             del data
@@ -652,6 +739,10 @@ class SlimClient:
                 if operation == "bye":
                     bye = True
                     break
+                if operation == "stat":
+                    # the player's clock is tracked against the time its report was read
+                    create_task(self._process_stat(packet, received_at))
+                    continue
                 handler = getattr(self, f"_process_{operation}", None)
                 if handler is None:
                     self.logger.debug("No handler for %s", operation)
@@ -715,6 +806,11 @@ class SlimClient:
         self._device_type = DEVICE_TYPE.get(dev_id, "unknown device")
         self._capabilities = parse_capabilities(data)
         self.logger.debug("Player connected: %s", self.player_id)
+        # a (re)connecting player reports a fresh clock: drift tracked during a long
+        # disconnection is reset immediately (Lyrion bug 10634)
+        self._jiffies_epoch.reset()
+        self._last_status = None
+        self._playpoint = None
         # Use SqueezePlay volume params for software players (matching LMS behavior)
         if self._device_type in SOFTWARE_PLAYER_TYPES:
             current_volume = self.volume_control.volume
@@ -841,10 +937,88 @@ class SlimClient:
         # from the data stream either because the stream ended, or because
         # they have finished buffering the current file
 
-    async def _process_stat(self, data: bytes) -> None:
+    @staticmethod
+    def _parse_stat(
+        event: str, payload: bytes, received_at: float
+    ) -> SlimStatus | None:
+        """Parse the status struct every STAT event carries, None if it is too short."""
+        if len(payload) < STAT_STRUCT_SIZE:
+            return None
+        (
+            _num_crlf,
+            _mas_initialized,
+            _mas_mode,
+            stream_buffer_size,
+            stream_buffer_fullness,
+            bytes_received_h,
+            bytes_received_l,
+            signal_strength,
+            jiffies,
+            output_buffer_size,
+            output_buffer_fullness,
+            elapsed_seconds,
+            voltage,
+            elapsed_milliseconds,
+            server_timestamp,
+        ) = struct.unpack(STAT_STRUCT, payload[:STAT_STRUCT_SIZE])
+        error_code = 0
+        if len(payload) >= STAT_STRUCT_SIZE + 2:
+            (error_code,) = struct.unpack(
+                "!H", payload[STAT_STRUCT_SIZE : STAT_STRUCT_SIZE + 2]
+            )
+        return SlimStatus(
+            event=event,
+            received_at=received_at,
+            jiffies=jiffies,
+            elapsed_seconds=elapsed_seconds,
+            elapsed_milliseconds=elapsed_milliseconds,
+            stream_buffer_size=stream_buffer_size,
+            stream_buffer_fullness=stream_buffer_fullness,
+            output_buffer_size=output_buffer_size,
+            output_buffer_fullness=output_buffer_fullness,
+            bytes_received=(bytes_received_h << 32) | bytes_received_l,
+            signal_strength=signal_strength,
+            voltage=voltage,
+            server_timestamp=server_timestamp,
+            error_code=error_code,
+        )
+
+    def _track_stat(self, status: SlimStatus) -> None:
+        """Feed a status report to the clock tracker and refresh the play point."""
+        self._last_status = status
+        if status.jiffies == 0:
+            # a zero-filled report carries no clock information
+            return
+        self._jiffies_epoch.track(status.jiffies, status.received_at)
+        if self._awaiting_stream_start and status.event != "STMs":
+            # reports of the flushed stream describe nothing current; the STMs
+            # itself is the first report of the new stream (elapsed 0)
+            return
+        elapsed = status.elapsed_milliseconds / 1000
+        if elapsed < status.elapsed_seconds:
+            # players reporting whole seconds only
+            elapsed = (
+                status.elapsed_seconds + (status.elapsed_milliseconds % 1000) / 1000
+            )
+        status_time = self.server_time_from_jiffies(status.jiffies)
+        self._playpoint = PlayPoint(
+            status_time=status_time,
+            apparent_start_time=status_time - elapsed,
+            elapsed=elapsed,
+            measured_at=status.received_at,
+            source=status.event,
+        )
+
+    async def _process_stat(
+        self, data: bytes, received_at: float | None = None
+    ) -> None:
         """Redirect incoming STAT event from player to correct method."""
+        if received_at is None:
+            received_at = time.time()
         event = data[:4].decode()
         event_data = data[4:]
+        if status := self._parse_stat(event, event_data, received_at):
+            self._track_stat(status)
         if event == "\x00\x00\x00\x00":
             # Presumed informational stat message
             return
@@ -953,26 +1127,15 @@ class SlimClient:
 
     def _process_stat_stmt(self, data: bytes) -> None:
         """Process incoming stat STMt message: heartbeat from client."""
-        (
-            _num_crlf,
-            _mas_initialized,
-            _mas_mode,
-            _rptr,
-            _wptr,
-            _bytes_received_h,
-            _bytes_received_l,
-            _signal_strength,
-            jiffies,
-            _output_buffer_size,
-            _output_buffer_readyness,
-            _elapsed_seconds,
-            _voltage,
-            elapsed_milliseconds,
-            _server_heartbeat,
-        ) = struct.unpack("!BBBLLLLHLLLLHLL", data[:47])
-
-        now = time.time()
-        self._jiffies = jiffies
+        status = self._last_status
+        if status is None or status.event != "STMt":
+            # called directly rather than through _process_stat
+            status = self._parse_stat("STMt", data, time.time())
+            if status is None:
+                return
+        # the extrapolation anchors at the time the report was read from the socket
+        now = status.received_at
+        self._jiffies = status.jiffies
         self._jiffies_timestamp = now
         self._last_timestamp = now
         if self._awaiting_stream_start:
@@ -980,7 +1143,7 @@ class SlimClient:
             # new stream starts (STMs), so we don't surface the old position
             self._elapsed_milliseconds = 0
         else:
-            self._elapsed_milliseconds = elapsed_milliseconds
+            self._elapsed_milliseconds = status.elapsed_milliseconds
         self.callback(self, EventType.PLAYER_HEARTBEAT)
 
     async def _process_stat_stmu(self, data: bytes) -> None:

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 
 from aioslimproto.client import SlimClient
+from aioslimproto.errors import PlayerClockUnknown
 from aioslimproto.models import EventType, MediaDetails, PlayerState
 
 # a cont frame as LMS sends it: metaint (no ICY metadata), loop and guid count
@@ -423,11 +424,45 @@ class TestRedirect:
         )
 
 
+def _stat_payload(
+    event: bytes,
+    *,
+    jiffies: int = 0,
+    elapsed_ms: int = 0,
+    elapsed_s: int = 0,
+    stream_size: int = 0,
+    stream_full: int = 0,
+    output_size: int = 0,
+    output_full: int = 0,
+    error_code: int | None = 0,
+) -> bytes:
+    """Build a STAT payload for the given event with the given status fields."""
+    payload = event + struct.pack(
+        "!BBBLLLLHLLLLHLL",
+        0,
+        0,
+        0,
+        stream_size,
+        stream_full,
+        0,
+        0,
+        0,
+        jiffies,
+        output_size,
+        output_full,
+        elapsed_s,
+        0,
+        elapsed_ms,
+        0,
+    )
+    if error_code is not None:
+        payload += struct.pack("!H", error_code)
+    return payload
+
+
 def _stmt_payload(jiffies: int) -> bytes:
     """Build an STMt STAT payload with the given player clock."""
-    return b"STMt" + struct.pack(
-        "!BBBLLLLHLLLLHLL", 0, 0, 0, 0, 0, 0, 0, 0, jiffies, 0, 0, 0, 0, 0, 0
-    )
+    return _stat_payload(b"STMt", jiffies=jiffies, error_code=None)
 
 
 class TestJiffies:
@@ -709,3 +744,313 @@ class TestPositionAcrossPauseAndResume:
         await live_client.pause()
         assert live_client.state == PlayerState.PAUSED
         assert live_client.elapsed_milliseconds == 4_000
+
+
+class TestStatReceiveTime:
+    """The clock tracker uses the time a report was read from the socket."""
+
+    @pytest.mark.asyncio
+    async def test_receive_time_is_taken_at_the_read_not_in_the_handler(
+        self, writer: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The epoch and the STMt anchor use the read time, not the handler's."""
+        reader = asyncio.StreamReader()
+        heartbeat = asyncio.Event()
+
+        def _callback(_client: SlimClient, event: EventType) -> None:
+            if event == EventType.PLAYER_HEARTBEAT:
+                heartbeat.set()
+
+        slim_client = SlimClient(reader, writer, _callback)
+        clock = iter([100.0, *([107.0] * 20)])
+        monkeypatch.setattr("aioslimproto.client.time", Mock(time=lambda: next(clock)))
+
+        reader.feed_data(_frame(b"STAT", _stat_payload(b"STMt", jiffies=5000)))
+        await asyncio.wait_for(heartbeat.wait(), 1)
+        reader.feed_eof()
+
+        assert slim_client.last_status is not None
+        assert slim_client.last_status.received_at == 100.0
+        assert slim_client.jiffies_epoch == 95.0
+        assert slim_client._jiffies_timestamp == 100.0  # noqa: SLF001
+        slim_client.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_packets_from_one_read_share_the_receive_time(
+        self, writer: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two reports arriving in one read are stamped with the same time."""
+        reader = asyncio.StreamReader()
+        slim_client = SlimClient(reader, writer, Mock())
+        slim_client._process_stat = AsyncMock()  # noqa: SLF001
+        monkeypatch.setattr("aioslimproto.client.time", Mock(time=lambda: 100.0))
+
+        reader.feed_data(
+            _frame(b"STAT", _stat_payload(b"STMt", jiffies=5000))
+            + _frame(b"STAT", _stat_payload(b"STMs", jiffies=5001))
+        )
+        reader.feed_eof()
+        await slim_client._reader_task  # noqa: SLF001
+
+        received = [c.args[1] for c in slim_client._process_stat.call_args_list]  # noqa: SLF001
+        assert received == [100.0, 100.0]
+
+
+class TestStatParsing:
+    """Every STAT event carries the same status struct and feeds the clock."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event",
+        [
+            b"STMt",
+            b"STMs",
+            b"STMc",
+            b"STMd",
+            b"STMl",
+            b"STMo",
+            b"STMp",
+            b"STMr",
+            b"STMu",
+            b"STMf",
+            b"STMn",
+            b"\x00\x00\x00\x00",
+        ],
+    )
+    async def test_every_event_is_tracked(
+        self, client: SlimClient, event: bytes
+    ) -> None:
+        """The status fields and the clock are taken from any STAT event."""
+        payload = _stat_payload(
+            event,
+            jiffies=40_000,
+            elapsed_ms=1234,
+            stream_full=65_536,
+            output_full=8_192,
+            error_code=3,
+        )
+        client.callback = Mock()
+
+        await client._process_stat(payload, received_at=100.0)  # noqa: SLF001
+
+        assert client.last_status is not None
+        assert client.last_status.event == event.decode()
+        assert client.stream_buffer_fullness == 65_536
+        assert client.output_buffer_fullness == 8_192
+        assert client.last_status.error_code == 3
+        assert client.jiffies_epoch == 60.0
+        heartbeats = [
+            c
+            for c in client.callback.call_args_list
+            if c.args[1] == EventType.PLAYER_HEARTBEAT
+        ]
+        assert bool(heartbeats) is (event == b"STMt")
+
+    @pytest.mark.asyncio
+    async def test_payload_without_error_code_is_tolerated(
+        self, client: SlimClient
+    ) -> None:
+        """Players that omit the trailing error code report it as zero."""
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=1000, error_code=None), received_at=10.0
+        )
+
+        assert client.last_status is not None
+        assert client.last_status.error_code == 0
+
+    @pytest.mark.asyncio
+    async def test_short_stat_is_dispatched_but_not_tracked(
+        self, client: SlimClient
+    ) -> None:
+        """A STAT without the status struct still reaches its handler."""
+        await client._process_stat(b"STMc", received_at=10.0)  # noqa: SLF001
+
+        assert client.state == PlayerState.BUFFERING
+        assert client.last_status is None
+        assert client.jiffies_epoch is None
+
+    @pytest.mark.asyncio
+    async def test_zero_jiffies_do_not_feed_the_clock(self, client: SlimClient) -> None:
+        """A zero-filled report is remembered but carries no clock information."""
+        await client._process_stat(b"STMc" + bytes(49), received_at=10.0)  # noqa: SLF001
+
+        assert client.last_status is not None
+        assert client.jiffies_epoch is None
+        assert client.playpoint is None
+
+
+class TestPlayPoint:
+    """The play point says when the current stream apparently started."""
+
+    @pytest.mark.asyncio
+    async def test_playpoint_maths(self, client: SlimClient) -> None:
+        """Status time comes from the clock tracker, the start is that minus elapsed."""
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=10_000), received_at=100.0
+        )
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=12_000, elapsed_ms=5_500), received_at=102.0
+        )
+
+        playpoint = client.playpoint
+        assert playpoint is not None
+        assert playpoint.status_time == pytest.approx(101.998)
+        assert playpoint.apparent_start_time == pytest.approx(96.498)
+        assert playpoint.elapsed == 5.5
+        assert playpoint.measured_at == 102.0
+        assert playpoint.source == "STMt"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("elapsed_ms", "elapsed_s", "expected"),
+        [(0, 7, 7.0), (300, 7, 7.3), (7_300, 7, 7.3)],
+    )
+    async def test_whole_seconds_fallback(
+        self, client: SlimClient, elapsed_ms: int, elapsed_s: int, expected: float
+    ) -> None:
+        """Players reporting whole seconds only still yield a sensible elapsed."""
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(
+                b"STMt", jiffies=1000, elapsed_ms=elapsed_ms, elapsed_s=elapsed_s
+            ),
+            received_at=10.0,
+        )
+
+        assert client.playpoint is not None
+        assert client.playpoint.elapsed == pytest.approx(expected)
+
+    @pytest.mark.asyncio
+    async def test_playpoint_is_none_until_the_first_stat(
+        self, client: SlimClient
+    ) -> None:
+        """Nothing is known about the stream before the player reported."""
+        assert client.playpoint is None
+        with pytest.raises(PlayerClockUnknown):
+            client.server_time_from_jiffies(1000)
+
+    @pytest.mark.asyncio
+    async def test_a_flush_drops_the_old_streams_playpoint_until_the_new_one_starts(
+        self, live_client: SlimClient
+    ) -> None:
+        """After a flush only the STMs of the new stream produces a play point again."""
+        await live_client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=1000, elapsed_ms=30_000), received_at=10.0
+        )
+        assert live_client.playpoint is not None
+
+        await live_client.play_url(url=_TRACK_URL, autostart=False, send_flush=True)
+        assert live_client.playpoint is None
+        await live_client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=2000, elapsed_ms=31_000), received_at=11.0
+        )
+        assert live_client.playpoint is None
+
+        await live_client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMs", jiffies=3000), received_at=12.0
+        )
+        playpoint = live_client.playpoint
+        assert playpoint is not None
+        assert playpoint.source == "STMs"
+        assert playpoint.apparent_start_time == playpoint.status_time
+
+        await live_client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=4000, elapsed_ms=1000), received_at=13.0
+        )
+        assert live_client.playpoint is not None
+        assert live_client.playpoint.source == "STMt"
+
+    @pytest.mark.asyncio
+    async def test_every_stat_refreshes_the_playpoint(self, client: SlimClient) -> None:
+        """Any STAT event with a clock updates the play point."""
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=1000), received_at=10.0
+        )
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMr", jiffies=1500, elapsed_ms=500), received_at=10.5
+        )
+
+        assert client.playpoint is not None
+        assert client.playpoint.source == "STMr"
+
+    @pytest.mark.asyncio
+    async def test_helo_resets_the_clock_and_the_playpoint(
+        self, client: SlimClient
+    ) -> None:
+        """A (re)connecting player reports a fresh clock."""
+        client.send_frame = AsyncMock()
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=1000), received_at=10.0
+        )
+        assert client.jiffies_epoch is not None
+
+        await client._process_helo(  # noqa: SLF001
+            struct.pack("BB6s", 12, 0, bytes.fromhex("aabbccddeeff")) + bytes(10)
+        )
+
+        assert client.jiffies_epoch is None
+        assert client.playpoint is None
+        assert client.last_status is None
+
+
+class TestPacketLatency:
+    """The assumed delivery delay shifts server-time conversions only."""
+
+    @pytest.mark.asyncio
+    async def test_default_and_effect(self, client: SlimClient) -> None:
+        """The default is 2 ms; raising it moves server time earlier only."""
+        await client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=1000), received_at=10.0
+        )
+        assert client.packet_latency_ms == 2
+        before = client.server_time_from_jiffies(3000)
+        target = client.jiffies_from_server_time(12.0)
+
+        client.packet_latency_ms = 10
+
+        assert client.server_time_from_jiffies(3000) == pytest.approx(before - 0.008)
+        assert client.jiffies_from_server_time(12.0) == target
+
+
+class TestStartAt:
+    """start_at encodes a server-time target on the player's clock."""
+
+    @pytest.mark.asyncio
+    async def test_start_at_encodes_the_target_on_the_player_clock(
+        self, live_client: SlimClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The strm u carries the player's clock value at the target time."""
+        monkeypatch.setattr("aioslimproto.client.time", Mock(time=lambda: 100.0))
+        await live_client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=10_000), received_at=100.0
+        )
+
+        await live_client.start_at(101.5)
+
+        send_strm = live_client._send_strm  # noqa: SLF001
+        assert send_strm.call_args.args[0] == b"u"  # type: ignore[attr-defined]
+        assert send_strm.call_args.kwargs["replay_gain"] == 11_500  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_a_target_in_the_past_is_sent_as_start_now(
+        self, live_client: SlimClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A past target wraps to a huge value, which the player treats as start now."""
+        monkeypatch.setattr("aioslimproto.client.time", Mock(time=lambda: 100.0))
+        await live_client._process_stat(  # noqa: SLF001
+            _stat_payload(b"STMt", jiffies=10_000), received_at=100.0
+        )
+
+        await live_client.start_at(89.0)
+
+        send_strm = live_client._send_strm  # noqa: SLF001
+        assert send_strm.call_args.kwargs["replay_gain"] == 2**32 - 1000  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_start_at_before_any_stat_raises(
+        self, live_client: SlimClient
+    ) -> None:
+        """Without a clock sample there is nothing to encode the target against."""
+        with pytest.raises(PlayerClockUnknown):
+            await live_client.start_at(100.0)
+
+        live_client._send_strm.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001

@@ -15,3 +15,7 @@ class UnsupportedCommand(SlimProtoException):
 
 class InvalidPlayer(SlimProtoException):
     """Raised when player was not found."""
+
+
+class PlayerClockUnknown(SlimProtoException):
+    """Raised when the player has not reported its clock (any STAT) yet."""

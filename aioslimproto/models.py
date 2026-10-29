@@ -263,6 +263,41 @@ class Preset:
     icon: str
 
 
+@dataclass(frozen=True)
+class SlimStatus:
+    """Status fields carried by every STAT event from the player."""
+
+    event: str  # the STAT event code, e.g. "STMt"
+    received_at: float  # time.time() when the frame was read from the socket
+    jiffies: int  # the player's clock in milliseconds (u32, wraps every ~49.7 days)
+    elapsed_seconds: int
+    elapsed_milliseconds: int
+    stream_buffer_size: int
+    stream_buffer_fullness: int
+    output_buffer_size: int
+    output_buffer_fullness: int
+    bytes_received: int
+    signal_strength: int
+    voltage: int
+    server_timestamp: int  # our strm-t heartbeat id echoed back; not used for timing
+    error_code: int  # 0 when the frame does not carry one
+
+
+@dataclass(frozen=True)
+class PlayPoint:
+    """Where the player was in its stream at a given server time (time.time())."""
+
+    status_time: (
+        float  # server time at which the player's clock read the STAT's jiffies
+    )
+    apparent_start_time: (
+        float  # status_time - elapsed: when the stream apparently started
+    )
+    elapsed: float  # seconds into the stream at status_time
+    measured_at: float  # time.time() when the STAT was read from the socket
+    source: str  # STAT event that produced it, e.g. "STMt" or "STMs"
+
+
 class CommandMessage(TypedDict):
     """Representation of Base JSON RPC Command Message."""
 
